@@ -7,6 +7,7 @@ using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Threading;
 using CommunityToolkit.Mvvm.Messaging.Internals;
 
@@ -74,6 +75,120 @@ public sealed class StrongReferenceMessenger : IMessenger
     // without having to use reflection. This shared map is used to unregister messages from a given recipients either unconditionally, by
     // message type, by token, or for a specific pair of message type and token value.
 
+    #region UnityUntypedSend
+
+    /// <summary>
+    /// Send message of specified type
+    /// </summary>
+    /// <param name="message">Message object to send</param>
+    /// <param name="type">Type of Message object</param>
+    public void SendTyped(object message, Type type)
+    {
+        ArgumentNullException.ThrowIfNull(message);
+        ArgumentNullException.ThrowIfNull(type);
+
+        object?[] rentedArray;
+        Span<object?> pairs;
+        int i = 0;
+
+        lock (this.recipientsMap)
+        {
+            // Check whether there are any registered recipients
+            if (!TryGetMapping(type, out Mapping? mapping))
+            {
+                return;
+            }
+
+            // Check the number of remaining handlers, see below
+            int totalHandlersCount = mapping.Count;
+
+            if (totalHandlersCount == 0)
+            {
+                return;
+            }
+
+            pairs = rentedArray = ArrayPool<object?>.Shared.Rent(2 * totalHandlersCount);
+
+            // Same logic as below, except here we're only traversing one handler per recipient
+            Dictionary2<Recipient, object?>.Enumerator mappingEnumerator = mapping.GetEnumerator();
+
+            while (mappingEnumerator.MoveNext())
+            {
+                pairs[2 * i] = mappingEnumerator.GetValue();
+                pairs[(2 * i) + 1] = mappingEnumerator.GetKey().Target;
+                i++;
+            }
+        }
+
+        try
+        {
+            // The core broadcasting logic is the same as the weak reference messenger one
+            SendTypedAll(pairs, i, message);
+        }
+        finally
+        {
+            // As before, we also need to clear it first to avoid having potentially long
+            // lasting memory leaks due to leftover references being stored in the pool.
+            Array.Clear(rentedArray, 0, 2 * i);
+
+            ArrayPool<object?>.Shared.Return(rentedArray);
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool TryGetMapping(Type type, [NotNullWhen(true)] out Mapping? mapping)
+    {
+        Type2 key = new(type, typeof(Unit));
+
+        if (this.typesMap.TryGetValue(key, out IMapping? target))
+        {
+            // This method and the ones below are the only ones handling values in the types map,
+            // and here we are sure that the object reference we have points to an instance of the
+            // right type. Using an unsafe cast skips two conditional branches and is faster.
+            mapping = Unsafe.As<Mapping>(target);
+
+            return true;
+        }
+
+        mapping = null;
+
+        return false;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void SendTypedAll(ReadOnlySpan<object?> pairs, int i, object message)
+    {
+        // This Slice calls executes bounds checks for the loop below, in case i was somehow wrong.
+        // The rest of the implementation relies on bounds checks removal and loop strength reduction
+        // done manually (which results in a 20% speedup during broadcast), since the JIT is not able
+        // to recognize this pattern. Skipping checks below is a provably safe optimization: the slice
+        // has exactly 2 * i elements (due to this slicing), and each loop iteration processes a pair.
+        // The loops ends when the initial reference reaches the end, and that's incremented by 2 at
+        // the end of each iteration. The target being a span, obviously means the length is constant.
+        ReadOnlySpan<object?> slice = pairs.Slice(0, 2 * i);
+
+        ref object? sliceStart = ref MemoryMarshal.GetReference(slice);
+        ref object? sliceEnd = ref Unsafe.Add(ref sliceStart, slice.Length);
+
+        while (Unsafe.IsAddressLessThan(ref sliceStart, ref sliceEnd))
+        {
+            object? handler = sliceStart;
+            object recipient = Unsafe.Add(ref sliceStart, 1)!;
+
+            if (handler is null)
+            {
+                throw new InvalidOperationException($"TypedSend does not support IRecipient implementations.");
+            }
+
+            Unsafe.As<MessageHandlerDispatcher>(handler).Invoke(recipient, message);
+
+            sliceStart = ref Unsafe.Add(ref sliceStart, 2);
+        }
+    }
+
+    #endregion
+
+
     /// <summary>
     /// The collection of currently registered recipients, with a link to their linked message receivers.
     /// </summary>
@@ -138,7 +253,8 @@ public sealed class StrongReferenceMessenger : IMessenger
     }
 
     /// <inheritdoc/>
-    public void Register<TRecipient, TMessage, TToken>(TRecipient recipient, TToken token, MessageHandler<TRecipient, TMessage> handler)
+    public void Register<TRecipient, TMessage, TToken>(TRecipient recipient, TToken token,
+        MessageHandler<TRecipient, TMessage> handler)
         where TRecipient : class
         where TMessage : class
         where TToken : IEquatable<TToken>
@@ -168,8 +284,8 @@ public sealed class StrongReferenceMessenger : IMessenger
     /// <param name="dispatcher">The input <see cref="MessageHandlerDispatcher"/> instance to register, or null.</param>
     /// <exception cref="InvalidOperationException">Thrown when trying to register the same message twice.</exception>
     private void Register<TMessage, TToken>(object recipient, TToken token, MessageHandlerDispatcher? dispatcher)
-       where TMessage : class
-       where TToken : IEquatable<TToken>
+        where TMessage : class
+        where TToken : IEquatable<TToken>
     {
         lock (this.recipientsMap)
         {
@@ -330,7 +446,8 @@ public sealed class StrongReferenceMessenger : IMessenger
             // matches with the token type currently in use, and operate on those instances.
             foreach (object obj in maps.AsSpan(0, i))
             {
-                IDictionary2<Recipient, IDictionary2<TToken>>? handlersMap = Unsafe.As<IDictionary2<Recipient, IDictionary2<TToken>>>(obj);
+                IDictionary2<Recipient, IDictionary2<TToken>>? handlersMap =
+                    Unsafe.As<IDictionary2<Recipient, IDictionary2<TToken>>>(obj);
 
                 // We don't need whether or not the map contains the recipient, as the
                 // sequence of maps has already been copied from the set containing all
@@ -565,7 +682,8 @@ public sealed class StrongReferenceMessenger : IMessenger
                 // handlers for different tokens. We can reuse the same variable
                 // to count the number of matching handlers to invoke later on.
                 // This will be the array slice with valid handler in the rented buffer.
-                Dictionary2<Recipient, Dictionary2<TToken, object?>>.Enumerator mappingEnumerator = mapping.GetEnumerator();
+                Dictionary2<Recipient, Dictionary2<TToken, object?>>.Enumerator mappingEnumerator =
+                    mapping.GetEnumerator();
 
                 // Explicit enumerator usage here as we're using a custom one
                 // that doesn't expose the single standard Current property.
